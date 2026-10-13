@@ -1,105 +1,113 @@
+# LangGraph_Frontend_Database.py
+
 import streamlit as st
-from LangGraph_Database_backend import (
+import uuid
+
+from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk
+
+from LangGraph_Tool_Backend import (
     chatbot,
     retrieve_all_threads,
     save_chat_title,
-    retrieve_chat_title
+    retrieve_chat_title,
 )
-from langchain_core.messages import HumanMessage
-import uuid
 
-# ****************************************
-# Utility Functions
-# ****************************************
+
+# --------------------------------------------------
+# Page configuration
+# --------------------------------------------------
+
+st.set_page_config(
+    page_title="LangGraph AI Chatbot",
+    page_icon="🤖",
+    layout="wide",
+)
+
+st.title("🤖 LangGraph AI Chatbot")
+
+
+# --------------------------------------------------
+# Session state initialization
+# --------------------------------------------------
 
 def generate_thread_id():
     return str(uuid.uuid4())
 
 
-def generate_chat_title(user_message):
-    """Generate a short, meaningful title for a conversation."""
-    try:
-        response = chatbot.invoke({
-            "messages": [
-                HumanMessage(
-                    content=(
-                        "Generate a short, meaningful title of 2-5 words "
-                        "for a chatbot conversation based on the user's "
-                        "message below. Return only the title, without "
-                        "quotes or explanations.\n\n"
-                        f"User message: {user_message}"
-                    )
-                )
-            ]
-        })
-
-        # Extract the final AI response.
-        messages = response.get("messages", [])
-        if messages:
-            title = messages[-1].content
-
-            if isinstance(title, str) and title.strip():
-                return title.strip().strip('"').strip("'")[:50]
-
-        return user_message[:30]
-
-    except Exception:
-        # Fallback if title generation fails.
-        return user_message[:30] or "New Chat"
-
+def generate_chat_title(message):
+    """Create a simple title from the user's first message."""
+    title = " ".join(message.strip().split())
+    return title[:40] + ("..." if len(title) > 40 else "")
 
 
 def add_thread(thread_id):
-    """Add a thread if it does not already exist."""
-
-    threads = st.session_state["chat_thread"]
-
-    # Convert any old string thread IDs into dictionaries.
-    normalized_threads = []
-
-    for item in threads:
-        if isinstance(item, str):
-            normalized_threads.append({
-                "thread_id": item,
-                "title": retrieve_chat_title(item),
-                "messages": []
-            })
-        elif isinstance(item, dict) and item.get("thread_id"):
-            item.setdefault(
-                "title",
-                retrieve_chat_title(item["thread_id"])
-            )
-            item.setdefault("messages", [])
-            normalized_threads.append(item)
-
-    st.session_state["chat_thread"] = normalized_threads
-
-    for thread in st.session_state["chat_thread"]:
-        if thread["thread_id"] == thread_id:
-            return
-
-    st.session_state["chat_thread"].append({
-        "thread_id": thread_id,
-        "title": retrieve_chat_title(thread_id),
-        "messages": []
-    })
+    """Add a thread to the current session's thread list."""
+    if thread_id not in st.session_state["chat_threads"]:
+        st.session_state["chat_threads"].append(thread_id)
 
 
+def get_thread_title(thread_id):
+    """Retrieve a saved title, with a fallback title."""
+    try:
+        title = retrieve_chat_title(thread_id)
+        if title:
+            return title
+    except Exception:
+        pass
 
-def save_message_to_thread(thread_id, message):
-    """Save an individual message to the correct thread."""
-    for thread in st.session_state["chat_thread"]:
-        if thread["thread_id"] == thread_id:
-            thread["messages"].append(message.copy())
-            return
+    return f"Chat {thread_id[:8]}"
 
 
+if "message_history" not in st.session_state:
+    st.session_state["message_history"] = []
+
+if "thread_id" not in st.session_state:
+    st.session_state["thread_id"] = generate_thread_id()
+
+if "chat_threads" not in st.session_state:
+    st.session_state["chat_threads"] = []
+
+if "chat_titles" not in st.session_state:
+    st.session_state["chat_titles"] = {}
+
+if "chat_thread" not in st.session_state:
+    st.session_state["chat_thread"] = {}
+
+if "title_saved_for_thread" not in st.session_state:
+    st.session_state["title_saved_for_thread"] = set()
+
+
+# Register the current thread.
+add_thread(st.session_state["thread_id"])
+
+
+# --------------------------------------------------
+# Retrieve existing threads
+# --------------------------------------------------
+
+try:
+    existing_threads = retrieve_all_threads()
+
+    if existing_threads:
+        for thread in existing_threads:
+            if isinstance(thread, dict):
+                thread_id = thread.get("thread_id")
+            else:
+                thread_id = thread
+
+            if thread_id:
+                add_thread(thread_id)
+
+except Exception as exc:
+    st.sidebar.warning(f"Could not load chat history: {exc}")
+
+
+# --------------------------------------------------
+# Load messages from a selected thread
+# --------------------------------------------------
 
 def load_thread(thread_id):
-    """Load a selected conversation from LangGraph's SQLite checkpoint."""
-
-    st.session_state["thread_id"] = thread_id
-
+    """Load the messages stored in the LangGraph checkpoint."""
     config = {
         "configurable": {
             "thread_id": thread_id
@@ -108,39 +116,55 @@ def load_thread(thread_id):
 
     try:
         state = chatbot.get_state(config)
-        langgraph_messages = state.values.get("messages", [])
+        values = state.values or {}
+        messages = values.get("messages", [])
 
         history = []
 
-        for message in langgraph_messages:
+        for message in messages:
             if isinstance(message, HumanMessage):
                 history.append({
                     "role": "user",
-                    "content": message.content
-                })
-            elif message.type == "ai":
-                history.append({
-                    "role": "assistant",
-                    "content": message.content
+                    "content": message.content,
                 })
 
-        st.session_state["message_history"] = history
+            elif isinstance(message, AIMessage):
+                # Avoid showing tool-call-only messages in chat history.
+                if getattr(message, "tool_calls", None):
+                    if not message.content:
+                        continue
 
-        # Update the in-memory frontend thread.
-        for thread in st.session_state["chat_thread"]:
-            if thread["thread_id"] == thread_id:
-                thread["messages"] = [
-                    message.copy() for message in history
-                ]
-                break
+                if message.content:
+                    if isinstance(message.content, str):
+                        content = message.content
+                    elif isinstance(message.content, list):
+                        content = "\n".join(
+                            block.get("text", "")
+                            for block in message.content
+                            if isinstance(block, dict)
+                            and block.get("type") == "text"
+                        )
+                    else:
+                        content = str(message.content)
 
-    except Exception as e:
-        st.error(f"Could not load conversation: {e}")
+                    if content.strip():
+                        history.append({
+                            "role": "assistant",
+                            "content": content,
+                        })
+
+        return history
+
+    except Exception as exc:
+        st.error(f"Could not load this conversation: {exc}")
+        return []
 
 
+# --------------------------------------------------
+# Start a new chat
+# --------------------------------------------------
 
 def reset_chat():
-    """Start a new conversation."""
     new_thread_id = generate_thread_id()
 
     st.session_state["thread_id"] = new_thread_id
@@ -149,174 +173,202 @@ def reset_chat():
     add_thread(new_thread_id)
 
 
-# ****************************************
-# Session State Setup
-# ****************************************
+# --------------------------------------------------
+# Sidebar: chat history
+# --------------------------------------------------
 
-if "message_history" not in st.session_state:
-    st.session_state["message_history"] = []
+with st.sidebar:
+    st.header("💬 Chat History")
 
-if "thread_id" not in st.session_state:
-    st.session_state["thread_id"] = generate_thread_id()
+    if st.button("➕ New Chat", use_container_width=True):
+        reset_chat()
+        st.rerun()
 
-if "chat_thread" not in st.session_state:
-    thread_ids = retrieve_all_threads()
+    st.divider()
 
-    st.session_state["chat_thread"] = [
-        {
-            "thread_id": tid,
-            "title": retrieve_chat_title(tid),
-            "messages": []
-        }
-        for tid in thread_ids
-    ]
-
-# Ensure the current thread exists.
-add_thread(st.session_state["thread_id"])
-
-
-# ****************************************
-# Sidebar UI
-# ****************************************
-
-st.sidebar.title("LangGraph Chatbot")
-
-if st.sidebar.button("➕ New Chat", use_container_width=True):
-    reset_chat()
-    st.rerun()
-
-st.sidebar.markdown("## Chat History")
-
-if not st.session_state["chat_thread"]:
-    st.sidebar.caption("No conversations yet.")
-
-for thread in st.session_state["chat_thread"]:
-    tid = thread["thread_id"]
-
-    # Show the conversation topic, not its UUID.
-    title = thread["title"]
-
-    if tid == st.session_state["thread_id"]:
-        button_label = f"🟢 {title}"
-    else:
-        button_label = f"💬 {title}"
-
-    st.sidebar.button(
-        button_label,
-        key=f"thread_button_{tid}",
-        use_container_width=True,
-        on_click=load_thread,
-        args=(tid,)
-    )
-
-
-# ****************************************
-# Main Chat UI
-# ****************************************
-
-st.title("LangGraph Chatbot")
-
-# Display the selected conversation's messages.
-for message in st.session_state["message_history"]:
-    with st.chat_message(message["role"]):
-        if message["role"] == "assistant":
-            st.markdown(message["content"])
-        else:
-            st.write(message["content"])
-
-
-# ****************************************
-# Chat Input and Streaming Response
-# ****************************************
-
-user_input = st.chat_input("Type your message here...")
-
-if user_input:
-    current_thread_id = st.session_state["thread_id"]
-
-    # Find the active thread.
-    active_thread = next(
-        (
-            thread
-            for thread in st.session_state["chat_thread"]
-            if thread["thread_id"] == current_thread_id
-        ),
-        None
-    )
-
-    # Generate a topic title only for the first message.
-    
-    if active_thread and not active_thread["messages"]:
-        title = generate_chat_title(user_input)
-
-        active_thread["title"] = title
-
-        save_chat_title(
-            current_thread_id,
-            title
+    # Display the newest thread first.
+    for thread_id in reversed(st.session_state["chat_threads"]):
+        title = st.session_state["chat_titles"].get(
+            thread_id,
+            get_thread_title(thread_id),
         )
 
+        if st.button(
+            f"🗨️ {title}",
+            key=f"thread_{thread_id}",
+            use_container_width=True,
+        ):
+            st.session_state["thread_id"] = thread_id
+            st.session_state["message_history"] = load_thread(thread_id)
+            st.rerun()
 
-    # Save and display the user message.
-    user_message = {
-        "role": "user",
-        "content": user_input
-    }
 
-    st.session_state["message_history"].append(user_message)
+# --------------------------------------------------
+# Ensure the selected thread has its messages loaded
+# --------------------------------------------------
 
-    save_message_to_thread(
-        current_thread_id,
-        user_message
+current_thread_id = st.session_state["thread_id"]
+
+if not st.session_state["message_history"]:
+    st.session_state["message_history"] = load_thread(
+        current_thread_id
     )
 
-    with st.chat_message("user"):
-        st.write(user_input)
 
-    # Pass the thread ID to LangGraph.
-    CONFIG = {
+# --------------------------------------------------
+# Display existing conversation
+# --------------------------------------------------
+
+for message in st.session_state["message_history"]:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+
+# --------------------------------------------------
+# Chat input and response streaming
+# --------------------------------------------------
+
+user_input = st.chat_input("Ask me anything...")
+
+if user_input and user_input.strip():
+
+    user_input = user_input.strip()
+    current_thread_id = st.session_state["thread_id"]
+
+    config = {
         "configurable": {
             "thread_id": current_thread_id
-        },
-        "metadata": {
-            "thread_id": current_thread_id
-        },
-        "run_name": "chat_turn",
+        }
     }
 
-    # Stream the assistant's response.
-    with st.chat_message("assistant"):
+    # Save the user's message in the frontend history.
+    st.session_state["message_history"].append({
+        "role": "user",
+        "content": user_input,
+    })
+
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    # Save a title from the first user message.
+    if current_thread_id not in st.session_state["title_saved_for_thread"]:
+        title = generate_chat_title(user_input)
+
         try:
-            ai_message = st.write_stream(
-                message_chunk.content
+            save_chat_title(current_thread_id, title)
+        except Exception as exc:
+            st.sidebar.warning(f"Could not save chat title: {exc}")
+
+        st.session_state["chat_titles"][current_thread_id] = title
+        st.session_state["title_saved_for_thread"].add(
+            current_thread_id
+        )
+
+    # Mutable dictionary avoids the nonlocal scope error.
+    status_holder = {
+        "box": None,
+        "tool_used": False,
+    }
+
+    assistant_text = ""
+
+    try:
+        with st.chat_message("assistant"):
+
+            def ai_only_stream():
                 for message_chunk, metadata in chatbot.stream(
                     {
                         "messages": [
                             HumanMessage(content=user_input)
                         ]
                     },
-                    config=CONFIG,
-                    stream_mode="messages"
-                )
-                if isinstance(message_chunk.content, str)
-                and message_chunk.content
+                    config=config,
+                    stream_mode="messages",
+                ):
+
+                    node_name = metadata.get("langgraph_node")
+
+                    # Show status when the graph enters the tools node.
+                    if node_name == "tools":
+                        status_holder["tool_used"] = True
+
+                        if status_holder["box"] is None:
+                            status_holder["box"] = st.status(
+                                "🔧 Using a tool...",
+                                expanded=True,
+                            )
+
+                        # Do not display raw tool output as assistant text.
+                        continue
+
+                    # Ignore messages from unrelated graph nodes.
+                    if node_name != "chat_node":
+                        continue
+
+                    # The graph has returned to the assistant after tool use.
+                    if status_holder["box"] is not None:
+                        status_holder["box"].update(
+                            label="✅ Tool finished",
+                            state="complete",
+                            expanded=False,
+                        )
+                        status_holder["box"] = None
+
+                    if not isinstance(message_chunk, AIMessageChunk):
+                        continue
+
+                    # Do not render tool-call payloads.
+                    if getattr(message_chunk, "tool_calls", None):
+                        continue
+
+                    content = message_chunk.content
+
+                    if isinstance(content, str):
+                        if content:
+                            yield content
+
+                    elif isinstance(content, list):
+                        for block in content:
+                            if (
+                                isinstance(block, dict)
+                                and block.get("type") == "text"
+                                and block.get("text")
+                            ):
+                                yield block["text"]
+
+            assistant_text = st.write_stream(ai_only_stream())
+
+    except Exception as exc:
+        if status_holder["box"] is not None:
+            status_holder["box"].update(
+                label="❌ Tool or response failed",
+                state="error",
+                expanded=True,
             )
+            status_holder["box"] = None
 
-            # Save the assistant response.
-            assistant_message = {
-                "role": "assistant",
-                "content": ai_message
-            }
+        st.error(f"An error occurred: {exc}")
 
-            st.session_state["message_history"].append(
-                assistant_message
+    finally:
+        # Complete the status only if a tool was actually used
+        # and the status box is still open.
+        if (
+            status_holder["tool_used"]
+            and status_holder["box"] is not None
+        ):
+            status_holder["box"].update(
+                label="✅ Tool finished",
+                state="complete",
+                expanded=False,
             )
+            status_holder["box"] = None
 
-            save_message_to_thread(
-                current_thread_id,
-                assistant_message
-            )
+    # Persist the assistant response in the frontend history.
+    if assistant_text:
+        st.session_state["message_history"].append({
+            "role": "assistant",
+            "content": assistant_text,
+        })
 
-        except Exception as e:
-            st.error(f"Something went wrong: {e}")
-
+    # Refresh the chat history to show a newly saved title.
+    st.rerun()
