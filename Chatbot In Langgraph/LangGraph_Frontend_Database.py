@@ -277,7 +277,11 @@ if user_input:
     CONFIG = {
         "configurable": {
             "thread_id": current_thread_id
-        }
+        },
+        "metadata": {
+            "thread_id": current_thread_id
+        },
+        "run_name": "chat_turn",
     }
 
     # Stream the assistant's response.
